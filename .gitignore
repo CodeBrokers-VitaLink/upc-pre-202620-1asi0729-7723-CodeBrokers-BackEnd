@@ -1,0 +1,50 @@
+# Artefactos de compilación y cachés
+/target/
+/build/
+/.gradle/
+/out/
+/bin/
+*.class
+
+# IDEs y editores
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated/
+.springBeans
+.sts4-cache/
+/nbproject/private/
+/nbbuild/
+/nbdist/
+/.nb-gradle/
+
+# Archivos temporales y registros
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Credenciales locales
+.env
+.env.*
+!.env.example
+!.env.sample
+.aws/
+credentials/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
