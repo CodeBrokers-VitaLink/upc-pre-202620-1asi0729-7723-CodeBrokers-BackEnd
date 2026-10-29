@@ -1,0 +1,987 @@
+diff --git a/public/i18n/en.json b/public/i18n/en.json
+index 5e58972..4530337 100644
+--- a/public/i18n/en.json
++++ b/public/i18n/en.json
+@@ -120,7 +120,9 @@
+     "assignedDoctor": "Assigned doctor",
+     "reviewedBy": "Reviewed by",
+     "assignedDoctorRequired": "Only the doctor assigned to this patient can record the review.",
+-    "lastMedicalReview": "Latest medical review"
++    "lastMedicalReview": "Latest medical review",
++    "integrationPending": "Care data is not available for this account yet.",
++    "accessDenied": "You do not have permission to perform this operation."
+   },
+   "iam": {
+     "loginTitle": "Sign in",
+@@ -137,7 +139,7 @@
+     "hidePassword": "Hide password",
+     "emailRequired": "Enter a valid email address.",
+     "invalidCredentials": "Incorrect account. Check your email and password.",
+-    "loginUnavailable": "Unable to sign in. Check that the API is available and has the users resource.",
++    "loginUnavailable": "Unable to verify your session. Try again when the connection is restored.",
+     "account": "My account",
+     "profile": "My profile",
+     "fullName": "Full name",
+diff --git a/public/i18n/es.json b/public/i18n/es.json
+index 77000cb..4cdc0f2 100644
+--- a/public/i18n/es.json
++++ b/public/i18n/es.json
+@@ -120,7 +120,9 @@
+     "assignedDoctor": "Médico a cargo",
+     "reviewedBy": "Revisado por",
+     "assignedDoctorRequired": "Solo el médico asignado a este paciente puede registrar la revisión.",
+-    "lastMedicalReview": "Última revisión médica"
++    "lastMedicalReview": "Última revisión médica",
++    "integrationPending": "Los datos de cuidado todavía no están disponibles para esta cuenta.",
++    "accessDenied": "No tienes permiso para realizar esta operación."
+   },
+   "iam": {
+     "loginTitle": "Iniciar sesión",
+@@ -137,7 +139,7 @@
+     "hidePassword": "Ocultar contraseña",
+     "emailRequired": "Introduce un correo válido.",
+     "invalidCredentials": "Cuenta incorrecta. Verifica tu correo y contraseña.",
+-    "loginUnavailable": "No se pudo iniciar sesión. Verifica que la API esté disponible y tenga el recurso users.",
++    "loginUnavailable": "No se pudo verificar la sesión. Inténtalo de nuevo cuando se restablezca la conexión.",
+     "account": "Mi cuenta",
+     "profile": "Mi perfil",
+     "fullName": "Nombre completo",
+diff --git a/src/app/app.config.ts b/src/app/app.config.ts
+index 39012c3..8123ef3 100644
+--- a/src/app/app.config.ts
++++ b/src/app/app.config.ts
+@@ -1,9 +1,10 @@
+-import { ApplicationConfig, provideBrowserGlobalErrorListeners } from '@angular/core';
++import { ApplicationConfig, inject, provideBrowserGlobalErrorListeners } from '@angular/core';
+ import { provideRouter, withInMemoryScrolling } from '@angular/router';
+ import { routes } from './app.routes';
+-import { provideHttpClient } from '@angular/common/http';
++import { provideHttpClient, withInterceptors } from '@angular/common/http';
+ import { CARE_CONTEXT } from './care/infrastructure/care/care-context';
+-import { environment } from '../environments/environment';
++import { AuthenticationStore } from './iam/application/authentication.store';
++import { authInterceptor } from './iam/infrastructure/auth.interceptor';
+ import { provideTranslateService } from '@ngx-translate/core';
+ import { provideTranslateHttpLoader } from '@ngx-translate/http-loader';
+ 
+@@ -11,7 +12,7 @@ export const appConfig: ApplicationConfig = {
+   providers: [
+     provideBrowserGlobalErrorListeners(),
+     provideRouter(routes, withInMemoryScrolling({ scrollPositionRestoration: 'top' })),
+-    provideHttpClient(),
++    provideHttpClient(withInterceptors([authInterceptor])),
+     provideTranslateService({
+       lang: localStorage.getItem('vitalink-language') === 'en' ? 'en' : 'es',
+       fallbackLang: 'es',
+@@ -21,7 +22,7 @@ export const appConfig: ApplicationConfig = {
+ 
+     {
+       provide: CARE_CONTEXT,
+-      useValue: { providerId: environment.providerId, familyId: environment.familyId },
++      useFactory: () => inject(AuthenticationStore).careContext.asReadonly(),
+     },
+   ],
+ };
+diff --git a/src/app/app.spec.ts b/src/app/app.spec.ts
+index 9223684..59c0fb1 100644
+--- a/src/app/app.spec.ts
++++ b/src/app/app.spec.ts
+@@ -1,10 +1,15 @@
+ import { TestBed } from '@angular/core/testing';
+ import { App } from './app';
++import { provideRouter } from '@angular/router';
++import { provideHttpClient } from '@angular/common/http';
++import { provideHttpClientTesting } from '@angular/common/http/testing';
++import { provideTranslateService } from '@ngx-translate/core';
+ 
+ describe('App', () => {
+   beforeEach(async () => {
+     await TestBed.configureTestingModule({
+       imports: [App],
++      providers: [provideRouter([]), provideHttpClient(), provideHttpClientTesting(), provideTranslateService()],
+     }).compileComponents();
+   });
+ 
+@@ -14,10 +19,12 @@ describe('App', () => {
+     expect(app).toBeTruthy();
+   });
+ 
+-  it('should render title', async () => {
++  it('renders the brand without showing protected navigation before authentication', async () => {
+     const fixture = TestBed.createComponent(App);
+     await fixture.whenStable();
+     const compiled = fixture.nativeElement as HTMLElement;
+-    expect(compiled.querySelector('h1')?.textContent).toContain('Hello, vitalink');
++    expect(compiled.querySelector('.brand')?.textContent).toContain('VitaLink');
++    expect(compiled.querySelector('aside')).toBeNull();
++    expect(compiled.querySelector('.family-nav')).toBeNull();
+   });
+ });
+diff --git a/src/app/app.ts b/src/app/app.ts
+index 3d6acea..eb4bd0e 100644
+--- a/src/app/app.ts
++++ b/src/app/app.ts
+@@ -36,10 +36,6 @@ export class App {
+     });
+   }
+   get role() {
+-    return this.router.url.startsWith('/doctor')
+-      ? 'doctor'
+-      : this.router.url.startsWith('/family')
+-        ? 'family'
+-        : '';
++    return this.authentication.role() ?? '';
+   }
+ }
+diff --git a/src/app/care/application/care.store.spec.ts b/src/app/care/application/care.store.spec.ts
+new file mode 100644
+index 0000000..4143021
+--- /dev/null
++++ b/src/app/care/application/care.store.spec.ts
+@@ -0,0 +1,47 @@
++import { TestBed } from '@angular/core/testing';
++import { signal } from '@angular/core';
++import { Subject } from 'rxjs';
++import { CareStore } from './care.store';
++import { CareService } from '../infrastructure/care/care.service';
++import { CARE_CONTEXT } from '../infrastructure/care/care-context';
++import { CareSnapshot } from '../domain/model/care.snapshot';
++import { AuthenticationStore } from '../../iam/application/authentication.store';
++import { UserStore } from '../../iam/application/user.store';
++import { TokenStorage } from '../../iam/infrastructure/token-storage';
++import { environment } from '../../../environments/environment';
++
++describe('Care session isolation', () => {
++  const empty: CareSnapshot = { patients: [], alerts: [], records: [], interventions: [], caregivers: [], measurementRanges: [] };
++  let previous = new Subject<CareSnapshot>();
++  let next = new Subject<CareSnapshot>();
++  let calls = 0;
++  const enabled = environment.careEnabled;
++  beforeEach(() => {
++    sessionStorage.clear(); previous = new Subject(); next = new Subject(); calls = 0;
++    TestBed.configureTestingModule({ providers: [
++      { provide: CareService, useValue: { load: () => ++calls === 1 ? previous : next } },
++      { provide: AuthenticationStore, useValue: { hasSession: () => true } },
++      { provide: UserStore, useValue: { user: signal(null) } },
++      { provide: CARE_CONTEXT, useValue: signal({ providerId: null, familyId: null, clinicId: null }) },
++    ] });
++  });
++  afterEach(() => { environment.careEnabled = enabled; TestBed.inject(TokenStorage).clear(); });
++  it('does not request demo clinical data in the IAM increment', () => {
++    environment.careEnabled = false;
++    const store = TestBed.inject(CareStore); store.load();
++    expect(calls).toBe(0); expect(store.error()).toBe('integrationPending');
++  });
++  it('cancels old work, clears state immediately and ignores late responses after another login', () => {
++    environment.careEnabled = true;
++    const store = TestBed.inject(CareStore); const tokens = TestBed.inject(TokenStorage);
++    store.load(); expect(store.loading()).toBe(true);
++    tokens.clear();
++    expect(store.loading()).toBe(false); expect(store.data()).toEqual(empty);
++    store.load();
++    previous.next({ ...empty, measurementRanges: [{} as never] }); previous.complete();
++    expect(store.data()).toEqual(empty); expect(store.loading()).toBe(true); expect(store.lastSync()).toBeNull();
++    next.next(empty); next.complete();
++    expect(store.loading()).toBe(false); expect(store.lastSync()).not.toBeNull();
++    tokens.clear(); expect(store.lastSync()).toBeNull();
++  });
++});
+diff --git a/src/app/care/application/care.store.ts b/src/app/care/application/care.store.ts
+index d588d94..c30ad6d 100644
+--- a/src/app/care/application/care.store.ts
++++ b/src/app/care/application/care.store.ts
+@@ -2,7 +2,9 @@ import { AuthenticationStore } from '../../iam/application/authentication.store'
+ import { UserStore } from '../../iam/application/user.store';
+ import { Injectable, inject, signal, computed, DestroyRef } from '@angular/core';
+ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+-import { finalize, switchMap, throwError, map } from 'rxjs';
++import { finalize, switchMap, throwError, map, takeUntil } from 'rxjs';
++import { TokenStorage } from '../../iam/infrastructure/token-storage';
++import { environment } from '../../../environments/environment';
+ import { CareService } from '../infrastructure/care/care.service';
+ import { CareSnapshot } from '../domain/model/care.snapshot';
+ import { CareAlert, AlertStatus } from '../domain/model/alert.entity';
+@@ -16,6 +18,14 @@ export class CareStore {
+   private readonly doctorProfile = inject(UserStore);
+   private readonly context = inject(CARE_CONTEXT);
+   private readonly destroy = inject(DestroyRef);
++  private readonly tokens = inject(TokenStorage);
++  constructor() {
++    this.tokens.invalidated.pipe(takeUntilDestroyed(this.destroy)).subscribe(() => this.clear());
++  }
++  clear(): void {
++    this.data.set({ patients: [], alerts: [], records: [], interventions: [], caregivers: [], measurementRanges: [] });
++    this.loading.set(false); this.saving.set(false); this.error.set(''); this.message.set(''); this.lastSync.set(null);
++  }
+   readonly data = signal<CareSnapshot>({
+     patients: [],
+     alerts: [],
+@@ -29,12 +39,12 @@ export class CareStore {
+   readonly error = signal('');
+   readonly message = signal('');
+   readonly lastSync = signal<string | null>(null);
+-  readonly currentCaregiver = computed(() => this.data().caregivers.find(c => c.id === this.context.familyId));
++  readonly currentCaregiver = computed(() => this.data().caregivers.find(c => c.id === this.context().familyId));
+   readonly professionalPatients = computed(() =>
+-    this.data().patients.filter((p) => p.providerId === this.context.providerId),
++    this.data().patients.filter((p) => p.providerId === this.context().providerId),
+   );
+   readonly familyPatients = computed(() =>
+-    this.data().patients.filter((p) => p.familyIds.includes(this.context.familyId)),
++    this.data().patients.filter((p) => p.familyIds.includes(this.context().familyId ?? '')),
+   );
+   readonly professionalAlerts = computed(() =>
+     this.data().alerts.filter((a) => this.professionalPatients().some((p) => p.id === a.patientId)),
+@@ -48,12 +58,15 @@ export class CareStore {
+       ).size,
+   );
+   load() {
++    if (!this.authentication.hasSession()) return;
++    if (!environment.careEnabled) { this.error.set('integrationPending'); return; }
+     if (this.loading() || this.saving()) return;
+     this.loading.set(true);
+     this.error.set('');
+     this.service
+       .load()
+       .pipe(
++        takeUntil(this.tokens.invalidated),
+         takeUntilDestroyed(this.destroy),
+         finalize(() => this.loading.set(false)),
+       )
+@@ -62,7 +75,7 @@ export class CareStore {
+           this.applySnapshot(data);
+           this.lastSync.set(new Date().toISOString());
+         },
+-        error: () => this.error.set('loadError'),
++        error: err => this.error.set(err.status === 403 ? 'accessDenied' : 'loadError'),
+       });
+   }
+   recordsFor(id: string) {
+@@ -81,11 +94,12 @@ export class CareStore {
+       .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+   }
+   changeStatus(alert: CareAlert, to: AlertStatus, note: string) {
++    if (!environment.careEnabled) { this.error.set('integrationPending'); return; }
+     if (this.saving()) return;
+     const session = this.authentication.session();
+     const doctor = this.doctorProfile.user();
+     const patient = this.data().patients.find(patient => patient.id === alert.patientId);
+-    if (!session || session.role.code !== 'doctor' || !doctor || doctor.role.code !== 'doctor' || doctor.id !== session.userId || patient?.providerId !== doctor.id) {
++    if (!session || session.role.code !== 'doctor' || !doctor || doctor.role.code !== 'doctor' || doctor.id !== session.userId || !this.context().providerId || patient?.providerId !== this.context().providerId) {
+       this.error.set('assignedDoctorRequired');
+       return;
+     }
+@@ -121,6 +135,7 @@ export class CareStore {
+               ),
+             );
+         }),
++        takeUntil(this.tokens.invalidated),
+         takeUntilDestroyed(this.destroy),
+         finalize(() => this.saving.set(false)),
+       )
+@@ -134,10 +149,10 @@ export class CareStore {
+           this.message.set('saved');
+         },
+         error: (err) => {
+-          this.error.set(err.message === 'conflict' ? 'conflict' : 'saveError');
++          this.error.set(err.status === 403 ? 'accessDenied' : err.message === 'conflict' ? 'conflict' : 'saveError');
+           this.service
+             .load()
+-            .pipe(takeUntilDestroyed(this.destroy))
++            .pipe(takeUntil(this.tokens.invalidated), takeUntilDestroyed(this.destroy))
+             .subscribe({ next: (d) => this.applySnapshot(d), error: () => {} });
+         },
+       });
+diff --git a/src/app/care/infrastructure/care/care-context.ts b/src/app/care/infrastructure/care/care-context.ts
+index bb671af..a5dc69d 100644
+--- a/src/app/care/infrastructure/care/care-context.ts
++++ b/src/app/care/infrastructure/care/care-context.ts
+@@ -1,6 +1,7 @@
+-import { InjectionToken } from '@angular/core';
++import { InjectionToken, Signal } from '@angular/core';
+ export interface CareContext {
+-  providerId: string;
+-  familyId: string;
++  providerId: string | null;
++  familyId: string | null;
++  clinicId: string | null;
+ }
+-export const CARE_CONTEXT = new InjectionToken<CareContext>('CARE_CONTEXT');
++export const CARE_CONTEXT = new InjectionToken<Signal<CareContext>>('CARE_CONTEXT');
+diff --git a/src/app/care/presentation/views/care-workspace/care-workspace.ts b/src/app/care/presentation/views/care-workspace/care-workspace.ts
+index 1afd10d..48d2b3f 100644
+--- a/src/app/care/presentation/views/care-workspace/care-workspace.ts
++++ b/src/app/care/presentation/views/care-workspace/care-workspace.ts
+@@ -1,8 +1,9 @@
+ import { UserStore } from '../../../../iam/application/user.store';
+ import { PatientSummary } from '../../components/patient-summary/patient-summary';
+-import { Component, inject, computed, signal } from '@angular/core';
++import { Component, inject, computed, signal, DestroyRef } from '@angular/core';
++import { TokenStorage } from '../../../../iam/infrastructure/token-storage';
+ import { ActivatedRoute, RouterLink } from '@angular/router';
+-import { toSignal } from '@angular/core/rxjs-interop';
++import { toSignal, takeUntilDestroyed } from '@angular/core/rxjs-interop';
+ import { FormsModule } from '@angular/forms';
+ import { MatButtonModule } from '@angular/material/button';
+ import { MatFormFieldModule } from '@angular/material/form-field';
+@@ -51,7 +52,7 @@ export class CareWorkspace {
+   readonly patients = computed(() =>
+     this.role() === 'doctor' ? this.store.professionalPatients() : this.store.familyPatients(),
+   );
+-  readonly selectedId = signal(sessionStorage.getItem('vitalink-patient') ?? '');
++  readonly selectedId = signal('');
+   readonly patient = computed(() => {
+     const alertId = this.params().get('alertId');
+     const id =
+@@ -135,8 +136,10 @@ export class CareWorkspace {
+ 
+   observation = '';
+   validation = '';
+-  readonly familyId = inject(CARE_CONTEXT).familyId;
++  private readonly context = inject(CARE_CONTEXT);
++  get familyId() { return this.context().familyId; }
+   constructor() {
++    inject(TokenStorage).invalidated.pipe(takeUntilDestroyed(inject(DestroyRef))).subscribe(() => this.selectedId.set(''));
+     this.store.load();
+     if (this.role() === 'doctor') this.doctorProfile.load();
+   }
+@@ -156,7 +159,6 @@ export class CareWorkspace {
+   }
+   select(id: string) {
+     this.selectedId.set(id);
+-    sessionStorage.setItem('vitalink-patient', id);
+   }
+   clear() {
+     this.query.set('');
+diff --git a/src/app/iam/application/authentication.store.spec.ts b/src/app/iam/application/authentication.store.spec.ts
+new file mode 100644
+index 0000000..958f903
+--- /dev/null
++++ b/src/app/iam/application/authentication.store.spec.ts
+@@ -0,0 +1,109 @@
++import { TestBed } from '@angular/core/testing';
++import { provideHttpClient, withInterceptors } from '@angular/common/http';
++import { provideHttpClientTesting, HttpTestingController } from '@angular/common/http/testing';
++import { provideRouter, Router } from '@angular/router';
++import { AuthenticationStore } from './authentication.store';
++import { TokenStorage } from '../infrastructure/token-storage';
++import { authInterceptor } from '../infrastructure/auth.interceptor';
++import { environment } from '../../../environments/environment';
++import { UserResponse } from '../infrastructure/user.response';
++import { RoleAssembler } from '../infrastructure/role.assembler';
++import { roleGuard } from '../presentation/guards/role.guard';
++import { ActivatedRouteSnapshot, RouterStateSnapshot } from '@angular/router';
++import { Observable } from 'rxjs';
++
++const doctor: UserResponse = { id: 'account-a', name: 'Doctor', email: 'doctor@example.test', role: 'doctor',
++  careContext: { providerId: 'profile-a', clinicId: 'clinic-a', familyId: null } };
++describe('Validated session', () => {
++  let requests: HttpTestingController;
++  let tokens: TokenStorage;
++  beforeEach(() => {
++    sessionStorage.clear();
++    TestBed.configureTestingModule({ providers: [provideRouter([]), provideHttpClient(withInterceptors([authInterceptor])), provideHttpClientTesting()] });
++    requests = TestBed.inject(HttpTestingController);
++  });
++  afterEach(() => { requests.verify(); tokens?.clear(); });
++  function store() {
++    tokens = TestBed.inject(TokenStorage);
++    return TestBed.inject(AuthenticationStore);
++  }
++  function restored() {
++    sessionStorage.setItem('vitalink-access-token', JSON.stringify({ accessToken: 'stored', expiresAt: Date.now() + 900000 }));
++    return store();
++  }
++  it('posts credentials without transforming the password and accepts server identity', () => {
++    const authentication = store();
++    authentication.signIn(' Doctor@Example.test ', ' exact password ').subscribe();
++    const request = requests.expectOne(environment.authApiUrl + '/auth/login');
++    expect(request.request.method).toBe('POST');
++    expect(request.request.body).toEqual({ email: 'doctor@example.test', password: ' exact password ' });
++    request.flush({ accessToken: 'signed', tokenType: 'Bearer', expiresIn: 900, user: doctor });
++    expect(authentication.session()?.userId).toBe('account-a');
++    expect(authentication.careContext().providerId).toBe('profile-a');
++    expect(sessionStorage.getItem('vitalink-access-token')).not.toContain('password');
++  });
++  it('restores only after /me and the guard waits for that validation', () => {
++    const authentication = restored();
++    expect(authentication.status()).toBe('pending'); expect(authentication.hasSession()).toBe(false);
++    let resolved = false;
++    const route = { data: { role: 'doctor' } } as unknown as ActivatedRouteSnapshot;
++    const result = TestBed.runInInjectionContext(() => roleGuard(route, {} as RouterStateSnapshot));
++    (result as Observable<unknown>).subscribe(value => { expect(value).toBe(true); resolved = true; });
++    expect(resolved).toBe(false);
++    requests.expectOne(environment.authApiUrl + '/auth/me').flush(doctor);
++    expect(resolved).toBe(true); expect(authentication.hasSession()).toBe(true);
++  });
++  it('keeps network failure recoverable without granting access', () => {
++    const authentication = restored();
++    authentication.ensureValidated().subscribe();
++    requests.expectOne(environment.authApiUrl + '/auth/me').error(new ProgressEvent('network'));
++    expect(authentication.status()).toBe('unavailable'); expect(authentication.hasSession()).toBe(false);
++    expect(tokens.token()).toBe('stored');
++    authentication.ensureValidated().subscribe();
++    requests.expectOne(environment.authApiUrl + '/auth/me').flush(doctor);
++    expect(authentication.hasSession()).toBe(true);
++  });
++  it('rejects corrupt, expired, and legacy forged storage', () => {
++    sessionStorage.setItem('vitalink-access-token', '{broken');
++    sessionStorage.setItem('vitalink-login-session', JSON.stringify({ userId: 'admin', role: { code: 'doctor' } }));
++    const authentication = store();
++    expect(authentication.hasSession()).toBe(false); expect(tokens.token()).toBeNull();
++    expect(sessionStorage.getItem('vitalink-login-session')).toBeNull();
++  });
++  it('rejects a forged token after server revalidation', () => {
++    const authentication = restored();
++    authentication.ensureValidated().subscribe();
++    requests.expectOne(environment.authApiUrl + '/auth/me').flush({}, { status: 401, statusText: 'Unauthorized' });
++    expect(authentication.hasSession()).toBe(false); expect(tokens.token()).toBeNull();
++  });
++  it('cancels a pending restoration when a new login starts', () => {
++    const authentication = restored();
++    authentication.ensureValidated().subscribe();
++    const previous = requests.expectOne(environment.authApiUrl + '/auth/me');
++    authentication.signIn('family@example.test', 'password').subscribe();
++    expect(previous.cancelled).toBe(true);
++    requests.expectOne(environment.authApiUrl + '/auth/login').flush({ accessToken: 'new', tokenType: 'Bearer', expiresIn: 900,
++      user: { ...doctor, id: 'account-b', role: 'family', careContext: { providerId: null, clinicId: null, familyId: 'caregiver-b' } } });
++    expect(authentication.session()?.userId).toBe('account-b');
++    expect(authentication.careContext().providerId).toBeNull();
++  });
++  it('cancels a pending login on logout and clears profile, context, and selection', () => {
++    const authentication = store();
++    authentication.signIn('doctor@example.test', 'password').subscribe();
++    const pending = requests.expectOne(environment.authApiUrl + '/auth/login');
++    sessionStorage.setItem('vitalink-patient', 'patient-a');
++    authentication.signOut();
++    expect(pending.cancelled).toBe(true); expect(authentication.user()).toBeNull();
++    expect(authentication.careContext().providerId).toBeNull();
++    expect(sessionStorage.getItem('vitalink-patient')).toBeNull();
++  });
++  it('distinguishes bad credentials from temporary failure and rejects unsupported roles', () => {
++    const authentication = store();
++    for (const status of [401, 503]) {
++      authentication.signIn('doctor@example.test', 'password').subscribe({ error: () => {} });
++      requests.expectOne(environment.authApiUrl + '/auth/login').flush({}, { status, statusText: 'Error' });
++      expect(authentication.error()).toBe(status === 401 ? 'invalidCredentials' : 'loginUnavailable');
++    }
++    expect(() => RoleAssembler.toEntity({ code: 'admin' } as never)).toThrow();
++  });
++});
+diff --git a/src/app/iam/application/authentication.store.ts b/src/app/iam/application/authentication.store.ts
+index bb98755..3669c98 100644
+--- a/src/app/iam/application/authentication.store.ts
++++ b/src/app/iam/application/authentication.store.ts
+@@ -1,21 +1,99 @@
+-import { Injectable, computed, inject, signal } from '@angular/core';
+-import { catchError, finalize, map, throwError } from 'rxjs';
++import { DestroyRef, Injectable, computed, inject, signal } from '@angular/core';
++import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
++import { HttpErrorResponse } from '@angular/common/http';
++import { Router } from '@angular/router';
++import { Observable, catchError, defaultIfEmpty, defer, finalize, map, of, shareReplay, takeUntil, throwError } from 'rxjs';
+ import { AuthenticationService } from '../infrastructure/authentication.service';
++import { TokenStorage } from '../infrastructure/token-storage';
++import { UserAssembler } from '../infrastructure/user.assembler';
++import { SessionAssembler } from '../infrastructure/session.assembler';
++import { UserResponse } from '../infrastructure/user.response';
++import { Session } from '../domain/model/session.entity';
++import { User } from '../domain/model/user.entity';
++
++const emptyContext = { providerId: null, familyId: null, clinicId: null };
+ @Injectable({ providedIn: 'root' })
+ export class AuthenticationStore {
+   private readonly service = inject(AuthenticationService);
+-  readonly session = signal(this.service.restore());
+-  readonly hasSession = computed(() => this.session() !== null);
++  readonly tokens = inject(TokenStorage);
++  private readonly router = inject(Router);
++  private readonly destroy = inject(DestroyRef);
++  readonly session = signal<Session | null>(null);
++  readonly user = signal<User | null>(null);
++  readonly careContext = signal<UserResponse['careContext']>(emptyContext);
++  readonly status = signal<'pending' | 'authenticated' | 'anonymous' | 'unavailable'>(this.tokens.token() ? 'pending' : 'anonymous');
++  readonly hasSession = computed(() => this.status() === 'authenticated' && this.session() !== null);
+   readonly role = computed(() => this.session()?.role.code ?? null);
+   readonly signingIn = signal(false);
+   readonly error = signal('');
+-  signIn(email: string, password: string) {
+-    this.signingIn.set(true); this.error.set('');
+-    return this.service.signIn(email, password).pipe(
+-      map(session => { this.session.set(session); return session.role.home; }),
+-      catchError(error => { this.error.set(error.message === 'invalidCredentials' ? 'invalidCredentials' : 'loginUnavailable'); return throwError(() => error); }),
+-      finalize(() => this.signingIn.set(false)),
++  private pending?: Observable<Session | null>;
++
++  constructor() {
++    this.tokens.invalidated.pipe(takeUntilDestroyed(this.destroy)).subscribe(() => {
++      const wasAuthenticated = this.hasSession();
++      this.session.set(null); this.user.set(null); this.careContext.set(emptyContext);
++      this.status.set('anonymous'); this.signingIn.set(false); this.error.set(''); this.pending = undefined;
++      if (wasAuthenticated) void this.router.navigateByUrl('/');
++    });
++  }
++
++  ensureValidated(force = false): Observable<Session | null> {
++    if (!this.tokens.token()) return of(null);
++    if (this.pending) return this.pending;
++    if (!force && this.hasSession()) return of(this.session());
++    this.status.set('pending');
++    const generation = this.tokens.generation();
++    this.pending = this.service.me().pipe(
++      takeUntil(this.tokens.invalidated),
++      map(response => {
++        if (generation !== this.tokens.generation()) return null;
++        return this.accept(response);
++      }),
++      catchError(error => {
++        if (generation === this.tokens.generation()) {
++          this.session.set(null); this.user.set(null); this.careContext.set(emptyContext);
++          if (error instanceof HttpErrorResponse && (error.status === 0 || error.status >= 500)) {
++            this.status.set('unavailable'); this.error.set('loginUnavailable');
++          } else { this.tokens.clear(); }
++        }
++        return of(null);
++      }),
++      defaultIfEmpty(null),
++      finalize(() => { if (generation === this.tokens.generation()) this.pending = undefined; }),
++      shareReplay({ bufferSize: 1, refCount: true }),
+     );
++    return this.pending;
++  }
++
++  signIn(email: string, password: string) {
++    return defer(() => {
++      this.tokens.clear();
++      const generation = this.tokens.generation();
++      this.signingIn.set(true); this.error.set('');
++      return this.service.signIn(email, password).pipe(
++        takeUntil(this.tokens.invalidated),
++        map(response => {
++          if (generation !== this.tokens.generation()) throw new Error('staleSession');
++          UserAssembler.toEntity(response.user);
++          if (response.tokenType !== 'Bearer') throw new Error('loginUnavailable');
++          this.tokens.save(response.accessToken, response.expiresIn);
++          return this.accept(response.user).role.home;
++        }),
++        catchError(error => {
++          if (generation === this.tokens.generation())
++            this.error.set(error instanceof HttpErrorResponse && error.status === 401 ? 'invalidCredentials' : 'loginUnavailable');
++          return throwError(() => error);
++        }),
++        finalize(() => { if (generation === this.tokens.generation()) this.signingIn.set(false); }),
++      );
++    });
++  }
++  signOut(): void { this.tokens.clear(); void this.router.navigateByUrl('/'); }
++  private accept(response: UserResponse): Session {
++    const user = UserAssembler.toEntity(response);
++    const session = SessionAssembler.fromUser(user, this.tokens.expiresAt());
++    this.user.set(user); this.careContext.set({ ...response.careContext });
++    this.session.set(session); this.status.set('authenticated'); this.error.set('');
++    return session;
+   }
+-  signOut(): void { this.service.signOut(); this.session.set(null); this.error.set(''); }
+ }
+diff --git a/src/app/iam/application/user.store.ts b/src/app/iam/application/user.store.ts
+index fb9ba2c..b9d7ccf 100644
+--- a/src/app/iam/application/user.store.ts
++++ b/src/app/iam/application/user.store.ts
+@@ -1,22 +1,13 @@
+-import { DestroyRef, Injectable, inject, signal } from '@angular/core';
++import { DestroyRef, Injectable, computed, inject } from '@angular/core';
+ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+-import { User } from '../domain/model/user.entity';
+-import { UserService } from '../infrastructure/user.service';
+ import { AuthenticationStore } from './authentication.store';
+ @Injectable({ providedIn: 'root' })
+ export class UserStore {
+-  private readonly service = inject(UserService);
+   private readonly authentication = inject(AuthenticationStore);
+   private readonly destroy = inject(DestroyRef);
+-  readonly user = signal<User | null>(null);
+-  readonly error = signal(false);
++  readonly user = this.authentication.user.asReadonly();
++  readonly error = computed(() => this.authentication.status() === 'unavailable');
+   load(): void {
+-    const id = this.authentication.session()?.userId;
+-    this.user.set(null); this.error.set(false);
+-    if (!id) return;
+-    this.service.findById(id).pipe(takeUntilDestroyed(this.destroy)).subscribe({
+-      next: user => { if (this.authentication.session()?.userId === id) this.user.set(user); },
+-      error: () => this.error.set(true),
+-    });
++    this.authentication.ensureValidated().pipe(takeUntilDestroyed(this.destroy)).subscribe();
+   }
+ }
+diff --git a/src/app/iam/domain/model/session.entity.ts b/src/app/iam/domain/model/session.entity.ts
+index 4c4e047..6123995 100644
+--- a/src/app/iam/domain/model/session.entity.ts
++++ b/src/app/iam/domain/model/session.entity.ts
+@@ -1,4 +1,4 @@
+ import { Role } from './role.entity';
+ export class Session {
+-  constructor(readonly userId: string, readonly role: Role) {}
++  constructor(readonly userId: string, readonly role: Role, readonly expiresAt: number) {}
+ }
+diff --git a/src/app/iam/infrastructure/auth.interceptor.spec.ts b/src/app/iam/infrastructure/auth.interceptor.spec.ts
+new file mode 100644
+index 0000000..950c084
+--- /dev/null
++++ b/src/app/iam/infrastructure/auth.interceptor.spec.ts
+@@ -0,0 +1,49 @@
++import { TestBed } from '@angular/core/testing';
++import { HttpClient, provideHttpClient, withInterceptors } from '@angular/common/http';
++import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
++import { authInterceptor } from './auth.interceptor';
++import { TokenStorage } from './token-storage';
++import { environment } from '../../../environments/environment';
++
++describe('Bearer boundary', () => {
++  let http: HttpClient;
++  let requests: HttpTestingController;
++  let tokens: TokenStorage;
++  beforeEach(() => {
++    sessionStorage.clear();
++    TestBed.configureTestingModule({ providers: [provideHttpClient(withInterceptors([authInterceptor])), provideHttpClientTesting()] });
++    http = TestBed.inject(HttpClient); requests = TestBed.inject(HttpTestingController); tokens = TestBed.inject(TokenStorage);
++    tokens.save('test-token', 900);
++  });
++  afterEach(() => { requests.verify(); tokens.clear(); });
++  it('attaches Bearer only to the exact API origin and path boundary', () => {
++    const base = environment.authApiUrl;
++    for (const url of [base + '/auth/me', '/i18n/es.json', 'https://vitallink-fakeapi.onrender.com/patients',
++      'https://example.test/api/v1/auth/me', 'http://localhost.evil.test:8080/api/v1/auth/me',
++      'http://localhost:8080/api/v10/auth/me', base + '/auth/login']) {
++      http.get(url).subscribe();
++      const request = requests.expectOne(url);
++      expect(request.request.headers.get('Authorization')).toBe(url === base + '/auth/me' ? 'Bearer test-token' : null);
++      request.flush({});
++    }
++  });
++  it('keeps the session on 403 and clears it on protected 401', () => {
++    for (const status of [403, 401]) {
++      http.get(environment.authApiUrl + '/auth/me').subscribe({ error: () => {} });
++      requests.expectOne(environment.authApiUrl + '/auth/me').flush({}, { status, statusText: 'Denied' });
++      expect(tokens.token()).toBe(status === 403 ? 'test-token' : null);
++    }
++  });
++  it('does not invalidate a newer session because of an older request', () => {
++    http.get(environment.authApiUrl + '/auth/me').subscribe({ error: () => {} });
++    const old = requests.expectOne(environment.authApiUrl + '/auth/me');
++    tokens.clear(); tokens.save('new-token', 900);
++    old.flush({}, { status: 401, statusText: 'Unauthorized' });
++    expect(tokens.token()).toBe('new-token');
++  });
++  it('does not treat a login rejection as expiration of a protected session', () => {
++    http.post(environment.authApiUrl + '/auth/login', {}).subscribe({ error: () => {} });
++    requests.expectOne(environment.authApiUrl + '/auth/login').flush({}, { status: 401, statusText: 'Unauthorized' });
++    expect(tokens.token()).toBe('test-token');
++  });
++});
+diff --git a/src/app/iam/infrastructure/auth.interceptor.ts b/src/app/iam/infrastructure/auth.interceptor.ts
+new file mode 100644
+index 0000000..7fcca78
+--- /dev/null
++++ b/src/app/iam/infrastructure/auth.interceptor.ts
+@@ -0,0 +1,29 @@
++import { inject } from '@angular/core';
++import { HttpErrorResponse, HttpInterceptorFn } from '@angular/common/http';
++import { catchError, throwError } from 'rxjs';
++import { environment } from '../../../environments/environment';
++import { TokenStorage } from './token-storage';
++
++export function isProtectedApiUrl(value: string): boolean {
++  try {
++  const base = new URL(environment.authApiUrl, document.baseURI);
++  const url = new URL(value, document.baseURI);
++  const path = base.pathname.replace(/\/$/, '');
++  return url.origin === base.origin && !url.username && !url.password &&
++    (url.pathname === path || url.pathname.startsWith(path + '/')) &&
++    url.pathname !== path + '/auth/login';
++  } catch { return false; }
++}
++export const authInterceptor: HttpInterceptorFn = (request, next) => {
++  const tokens = inject(TokenStorage);
++  if (!isProtectedApiUrl(request.url)) return next(request);
++  const token = tokens.token();
++  const generation = tokens.generation();
++  return next(token ? request.clone({ setHeaders: { Authorization: 'Bearer ' + token } }) : request).pipe(
++    catchError(error => {
++      if (error instanceof HttpErrorResponse && error.status === 401 && token &&
++          tokens.generation() === generation) tokens.clear();
++      return throwError(() => error);
++    }),
++  );
++};
+diff --git a/src/app/iam/infrastructure/authentication.service.ts b/src/app/iam/infrastructure/authentication.service.ts
+index dd58241..3f519e4 100644
+--- a/src/app/iam/infrastructure/authentication.service.ts
++++ b/src/app/iam/infrastructure/authentication.service.ts
+@@ -1,40 +1,15 @@
+ import { Injectable, inject } from '@angular/core';
+ import { HttpClient } from '@angular/common/http';
+-import { map } from 'rxjs';
+-import { Session } from '../domain/model/session.entity';
+-import { SessionAssembler } from './session.assembler';
++import { environment } from '../../../environments/environment';
+ import { SessionResponse } from './session.response';
+ import { UserResponse } from './user.response';
+-import { UserAssembler } from './user.assembler';
+-import { environment } from '../../../environments/environment';
++
+ @Injectable({ providedIn: 'root' })
+ export class AuthenticationService {
+   private readonly http = inject(HttpClient);
+-  private readonly key = 'vitalink-login-session';
+-  restore(): Session | null {
+-    try {
+-      const raw = sessionStorage.getItem(this.key);
+-      if (!raw) return null;
+-      const value: unknown = JSON.parse(raw);
+-      if (!this.isSession(value)) { this.signOut(); return null; }
+-      return SessionAssembler.toEntity(value);
+-    } catch { this.signOut(); return null; }
+-  }
+   signIn(email: string, password: string) {
+-    return this.http.get<UserResponse[]>(environment.apiUrl + '/users', {params: {email: email.trim().toLowerCase()}}).pipe(map(users => {
+-      const response = users.find(user => user.email.toLowerCase() === email.trim().toLowerCase() && user.password === password && (user.role === 'doctor' || user.role === 'family'));
+-      if (!response) throw new Error('invalidCredentials');
+-      const user = UserAssembler.toEntity(response);
+-      const session = new Session(user.id, user.role);
+-      sessionStorage.setItem(this.key, JSON.stringify(SessionAssembler.toResponse(session)));
+-      return session;
+-    }));
+-  }
+-  signOut(): void { sessionStorage.removeItem(this.key); }
+-  private isSession(value: unknown): value is SessionResponse {
+-    if (!value || typeof value !== 'object') return false;
+-    const session = value as Partial<SessionResponse>;
+-    return typeof session.userId === 'string' && !!session.userId &&
+-      (session.role?.code === 'doctor' || session.role?.code === 'family');
++    return this.http.post<SessionResponse>(environment.authApiUrl + '/auth/login',
++      { email: email.trim().toLowerCase(), password });
+   }
++  me() { return this.http.get<UserResponse>(environment.authApiUrl + '/auth/me'); }
+ }
+diff --git a/src/app/iam/infrastructure/role.assembler.ts b/src/app/iam/infrastructure/role.assembler.ts
+index 916e968..c2dff27 100644
+--- a/src/app/iam/infrastructure/role.assembler.ts
++++ b/src/app/iam/infrastructure/role.assembler.ts
+@@ -1,6 +1,9 @@
+ import { Role } from '../domain/model/role.entity';
+ import { RoleResponse } from './role.response';
+ export class RoleAssembler {
+-  static toEntity(response: RoleResponse): Role { return new Role(response.code); }
++  static toEntity(response: RoleResponse): Role {
++    if (response.code !== 'doctor' && response.code !== 'family') throw new Error('unsupportedRole');
++    return new Role(response.code);
++  }
+   static toResponse(entity: Role): RoleResponse { return { code: entity.code }; }
+ }
+diff --git a/src/app/iam/infrastructure/session.assembler.ts b/src/app/iam/infrastructure/session.assembler.ts
+index 35900b9..2434163 100644
+--- a/src/app/iam/infrastructure/session.assembler.ts
++++ b/src/app/iam/infrastructure/session.assembler.ts
+@@ -1,7 +1,7 @@
+ import { Session } from '../domain/model/session.entity';
+-import { SessionResponse } from './session.response';
+-import { RoleAssembler } from './role.assembler';
++import { User } from '../domain/model/user.entity';
+ export class SessionAssembler {
+-  static toEntity(response: SessionResponse): Session { return new Session(response.userId, RoleAssembler.toEntity(response.role)); }
+-  static toResponse(entity: Session): SessionResponse { return {userId: entity.userId, role: RoleAssembler.toResponse(entity.role)}; }
++  static fromUser(user: User, expiresAt: number): Session {
++    return new Session(user.id, user.role, expiresAt);
++  }
+ }
+diff --git a/src/app/iam/infrastructure/session.response.ts b/src/app/iam/infrastructure/session.response.ts
+index b203295..cd4d638 100644
+--- a/src/app/iam/infrastructure/session.response.ts
++++ b/src/app/iam/infrastructure/session.response.ts
+@@ -1,3 +1,7 @@
+-import { RoleResponse } from './role.response';
+-/** Serialized local session; replace with the login response when a backend exists. */
+-export interface SessionResponse { userId: string; role: RoleResponse; }
++import { UserResponse } from './user.response';
++export interface SessionResponse {
++  accessToken: string;
++  tokenType: 'Bearer';
++  expiresIn: number;
++  user: UserResponse;
++}
+diff --git a/src/app/iam/infrastructure/token-storage.ts b/src/app/iam/infrastructure/token-storage.ts
+new file mode 100644
+index 0000000..0282e38
+--- /dev/null
++++ b/src/app/iam/infrastructure/token-storage.ts
+@@ -0,0 +1,55 @@
++import { Injectable, signal } from '@angular/core';
++import { Subject } from 'rxjs';
++
++@Injectable({ providedIn: 'root' })
++export class TokenStorage {
++  private readonly key = 'vitalink-access-token';
++  private readonly value = signal<{ accessToken: string; expiresAt: number } | null>(null);
++  private timer?: ReturnType<typeof setTimeout>;
++  readonly invalidated = new Subject<void>();
++  readonly generation = signal(0);
++
++  constructor() {
++    try {
++      sessionStorage.removeItem('vitalink-login-session');
++      sessionStorage.removeItem('vitalink-patient');
++      const raw = sessionStorage.getItem(this.key);
++      if (!raw) return;
++      const stored = JSON.parse(raw);
++      if (typeof stored?.accessToken !== 'string' || !stored.accessToken ||
++          !Number.isFinite(stored.expiresAt) || stored.expiresAt <= Date.now() ||
++          stored.expiresAt > Date.now() + 3600000) { this.clear(); return; }
++      this.value.set(stored);
++      this.scheduleExpiry();
++    } catch { this.clear(); }
++  }
++
++  token(): string | null {
++    if (this.value() && this.value()!.expiresAt <= Date.now()) this.clear();
++    return this.value()?.accessToken ?? null;
++  }
++  expiresAt(): number { return this.value()?.expiresAt ?? 0; }
++  save(accessToken: string, expiresIn: number): void {
++    if (!accessToken || !Number.isFinite(expiresIn) || expiresIn < 1 || expiresIn > 3600)
++      throw new Error('loginUnavailable');
++    const value = { accessToken, expiresAt: Date.now() + expiresIn * 1000 };
++    this.value.set(value);
++    try { sessionStorage.setItem(this.key, JSON.stringify(value)); } catch { /* Memory-only session. */ }
++    this.scheduleExpiry();
++  }
++  clear(): void {
++    clearTimeout(this.timer);
++    this.value.set(null);
++    this.generation.update(value => value + 1);
++    try {
++      sessionStorage.removeItem(this.key);
++      sessionStorage.removeItem('vitalink-login-session');
++      sessionStorage.removeItem('vitalink-patient');
++    } catch { /* Storage can be unavailable. */ }
++    this.invalidated.next();
++  }
++  private scheduleExpiry(): void {
++    clearTimeout(this.timer);
++    this.timer = setTimeout(() => this.clear(), Math.max(0, this.expiresAt() - Date.now()));
++  }
++}
+diff --git a/src/app/iam/infrastructure/user.assembler.ts b/src/app/iam/infrastructure/user.assembler.ts
+index b0e1393..9086674 100644
+--- a/src/app/iam/infrastructure/user.assembler.ts
++++ b/src/app/iam/infrastructure/user.assembler.ts
+@@ -3,6 +3,13 @@ import { RoleAssembler } from './role.assembler';
+ import { UserResponse } from './user.response';
+ export class UserAssembler {
+   static toEntity(response: UserResponse): User {
+-    return new User(response.id, response.name, response.email, RoleAssembler.toEntity({code: response.role}), response.phone ?? null, response.hospital ?? null);
++    if (!response || typeof response.id !== 'string' || !response.id ||
++        typeof response.name !== 'string' || typeof response.email !== 'string' ||
++        !response.careContext || !['providerId', 'familyId', 'clinicId'].every(key => {
++          const value = response.careContext[key as keyof typeof response.careContext];
++          return value === null || (typeof value === 'string' && !!value);
++        })) throw new Error('loginUnavailable');
++    return new User(response.id, response.name, response.email,
++      RoleAssembler.toEntity({ code: response.role }), response.phone ?? null, response.hospital ?? null);
+   }
+ }
+diff --git a/src/app/iam/infrastructure/user.response.ts b/src/app/iam/infrastructure/user.response.ts
+index 950b325..4c1e2d3 100644
+--- a/src/app/iam/infrastructure/user.response.ts
++++ b/src/app/iam/infrastructure/user.response.ts
+@@ -2,8 +2,8 @@ export interface UserResponse {
+   id: string;
+   name: string;
+   email: string;
+-  password: string;
+   role: 'doctor' | 'family';
+   phone?: string | null;
+   hospital?: string | null;
++  careContext: { providerId: string | null; familyId: string | null; clinicId: string | null };
+ }
+diff --git a/src/app/iam/infrastructure/user.service.ts b/src/app/iam/infrastructure/user.service.ts
+index f90a191..bb5f3f2 100644
+--- a/src/app/iam/infrastructure/user.service.ts
++++ b/src/app/iam/infrastructure/user.service.ts
+@@ -7,7 +7,7 @@ import { UserAssembler } from './user.assembler';
+ @Injectable({ providedIn: 'root' })
+ export class UserService {
+   private readonly http = inject(HttpClient);
+-  findById(id: string) {
+-    return this.http.get<UserResponse>(environment.apiUrl + '/users/' + encodeURIComponent(id)).pipe(map(UserAssembler.toEntity));
++  me() {
++    return this.http.get<UserResponse>(environment.authApiUrl + '/auth/me').pipe(map(UserAssembler.toEntity));
+   }
+ }
+diff --git a/src/app/iam/presentation/guards/role.guard.ts b/src/app/iam/presentation/guards/role.guard.ts
+index 46faea6..cf91da5 100644
+--- a/src/app/iam/presentation/guards/role.guard.ts
++++ b/src/app/iam/presentation/guards/role.guard.ts
+@@ -1,9 +1,12 @@
+ import { inject } from '@angular/core';
+ import { CanActivateFn, Router } from '@angular/router';
++import { map } from 'rxjs';
+ import { AuthenticationStore } from '../../application/authentication.store';
+ export const roleGuard: CanActivateFn = route => {
+-  const session = inject(AuthenticationStore).session();
++  const authentication = inject(AuthenticationStore);
+   const router = inject(Router);
+-  if (!session) return router.createUrlTree(['/']);
+-  return session.role.code === route.data['role'] || router.createUrlTree([session.role.home]);
++  return authentication.ensureValidated().pipe(map(session =>
++    !session ? router.createUrlTree(['/']) :
++      session.role.code === route.data['role'] || router.createUrlTree([session.role.home]),
++  ));
+ };
+diff --git a/src/app/iam/presentation/views/profile/profile.ts b/src/app/iam/presentation/views/profile/profile.ts
+index 0ef4acd..41f4634 100644
+--- a/src/app/iam/presentation/views/profile/profile.ts
++++ b/src/app/iam/presentation/views/profile/profile.ts
+@@ -1,6 +1,5 @@
+ import { Component, inject } from '@angular/core';
+ import { TranslatePipe } from '@ngx-translate/core';
+-import { Router } from '@angular/router';
+ import { MatButtonModule } from '@angular/material/button';
+ import { AuthenticationStore } from '../../../application/authentication.store';
+ import { UserStore } from '../../../application/user.store';
+@@ -12,7 +11,6 @@ import { UserStore } from '../../../application/user.store';
+ export class Profile {
+   readonly store = inject(UserStore);
+   private readonly authentication = inject(AuthenticationStore);
+-  private readonly router = inject(Router);
+-  signOut(): void { this.authentication.signOut(); this.store.user.set(null); void this.router.navigateByUrl('/'); }
++  signOut(): void { this.authentication.signOut(); }
+   constructor() { this.store.load(); }
+ }
+diff --git a/src/environments/environment.production.ts b/src/environments/environment.production.ts
+index f0b3a0b..6d156ac 100644
+--- a/src/environments/environment.production.ts
++++ b/src/environments/environment.production.ts
+@@ -1,6 +1,6 @@
+ export const environment = {
+   production: true,
+-  apiUrl: 'https://vitallink-fakeapi.onrender.com',
+-  providerId: 'DR-01',
+-  familyId: 'FC-01',
++  authApiUrl: '/api/v1',
++  apiUrl: '/api/v1',
++  careEnabled: false,
+ };
+diff --git a/src/environments/environment.ts b/src/environments/environment.ts
+index cb7ab62..01d1621 100644
+--- a/src/environments/environment.ts
++++ b/src/environments/environment.ts
+@@ -1,6 +1,6 @@
+ export const environment = {
+   production: false,
++  authApiUrl: 'http://localhost:8080/api/v1',
+   apiUrl: 'https://vitallink-fakeapi.onrender.com',
+-  providerId: 'DR-01',
+-  familyId: 'FC-01',
++  careEnabled: false,
+ };

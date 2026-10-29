@@ -1,0 +1,27 @@
+@baseUrl = http://localhost:8080/api/v1
+@accessToken = <paste-local-token>
+
+### Local physician login; password comes from the HTTP client's environment.
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+Accept-Language: es
+
+{"email":"doctor@example.test","password":"{{$env.LOCAL_DOCTOR_PASSWORD}}"}
+
+### Own profile
+GET {{baseUrl}}/auth/me
+Authorization: Bearer {{accessToken}}
+
+### Missing token: 401
+GET {{baseUrl}}/auth/me
+Accept-Language: es
+
+### Malformed token: 401
+GET {{baseUrl}}/auth/me
+Authorization: Bearer invalid.jwt.value
+
+### Allowed preflight
+OPTIONS {{baseUrl}}/auth/me
+Origin: http://localhost:4200
+Access-Control-Request-Method: GET
+Access-Control-Request-Headers: Authorization
